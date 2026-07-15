@@ -196,8 +196,11 @@ protected:
   bool first_scan_processed_;
   std::string pose_prior_topic_;
   double prior_max_time_offset_;
+  double prior_reseed_jump_distance_;
   int prior_optimize_every_n_nodes_;
   int nodes_since_optimization_{0}, attached_priors_{0};
+  karto::Pose2 last_processed_odom_pose_;
+  bool last_processed_odom_valid_{false};
   std::deque<slam_toolbox::msg::PosePrior::ConstSharedPtr> prior_buffer_;
   boost::mutex prior_buffer_mutex_;
 
