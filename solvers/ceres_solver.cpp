@@ -16,7 +16,10 @@ CeresSolver::CeresSolver()
 : nodes_(new std::unordered_map<int, Eigen::Vector3d>()),
   blocks_(new std::unordered_map<std::size_t,
     ceres::ResidualBlockId>()),
-  problem_(NULL), was_constant_set_(false)
+  prior_blocks_(new std::unordered_map<int,
+    std::pair<ceres::ResidualBlockId, Eigen::Vector2d>>()),
+  problem_(NULL), was_constant_set_(false),
+  prior_loss_function_(NULL), gauge_fix_first_node_(true)
 /*****************************************************************************/
 {
 }
@@ -71,6 +74,27 @@ void CeresSolver::Configure(rclcpp_lifecycle::LifecycleNode::SharedPtr node)
   }
   mode = node->get_parameter("mode").as_string();
 
+  std::string prior_loss_fn;
+  if (!node->has_parameter("ceres_prior_loss_function")) {
+    node->declare_parameter(
+      "ceres_prior_loss_function",
+      rclcpp::ParameterValue(std::string("HuberLoss")));
+  }
+  prior_loss_fn = node->get_parameter("ceres_prior_loss_function").as_string();
+
+  double prior_loss_scale;
+  if (!node->has_parameter("ceres_prior_loss_scale")) {
+    node->declare_parameter(
+      "ceres_prior_loss_scale", rclcpp::ParameterValue(0.5));
+  }
+  prior_loss_scale = node->get_parameter("ceres_prior_loss_scale").as_double();
+
+  if (!node->has_parameter("gauge_fix_first_node")) {
+    node->declare_parameter(
+      "gauge_fix_first_node", rclcpp::ParameterValue(true));
+  }
+  gauge_fix_first_node_ = node->get_parameter("gauge_fix_first_node").as_bool();
+
   debug_logging_ = node->get_parameter("debug_logging").as_bool();
 
   corrections_.clear();
@@ -91,6 +115,14 @@ void CeresSolver::Configure(rclcpp_lifecycle::LifecycleNode::SharedPtr node)
       node->get_logger(),
       "CeresSolver: Using CauchyLoss loss function.");
     loss_function_ = new ceres::CauchyLoss(0.7);
+  }
+
+  // choose loss function for absolute pose priors, default Huber
+  prior_loss_function_ = NULL;
+  if (prior_loss_fn == "HuberLoss") {
+    prior_loss_function_ = new ceres::HuberLoss(prior_loss_scale);
+  } else if (prior_loss_fn == "CauchyLoss") {
+    prior_loss_function_ = new ceres::CauchyLoss(prior_loss_scale);
   }
 
   // choose linear solver default CHOL
@@ -199,11 +231,17 @@ CeresSolver::~CeresSolver()
   if (loss_function_ != NULL) {
     delete loss_function_;
   }
+  if (prior_loss_function_ != NULL) {
+    delete prior_loss_function_;
+  }
   if (nodes_ != NULL) {
     delete nodes_;
   }
   if (blocks_ != NULL) {
     delete blocks_;
+  }
+  if (prior_blocks_ != NULL) {
+    delete prior_blocks_;
   }
   if (problem_ != NULL) {
     delete problem_;
@@ -224,8 +262,27 @@ void CeresSolver::Compute()
     return;
   }
 
-  // populate contraint for static initial pose
-  if (!was_constant_set_ && first_node_ != nodes_->end() &&
+  // release the gauge fix once absolute pose priors anchor the graph
+  if (!gauge_fix_first_node_ && was_constant_set_ && !prior_blocks_->empty() &&
+    first_node_ != nodes_->end() &&
+    problem_->HasParameterBlock(&first_node_->second(0)) &&
+    problem_->HasParameterBlock(&first_node_->second(1)) &&
+    problem_->HasParameterBlock(&first_node_->second(2)))
+  {
+    RCLCPP_INFO(
+      logger_,
+      "CeresSolver: Releasing constant first node, "
+      "%zu pose priors anchor the graph.", prior_blocks_->size());
+    problem_->SetParameterBlockVariable(&first_node_->second(0));
+    problem_->SetParameterBlockVariable(&first_node_->second(1));
+    problem_->SetParameterBlockVariable(&first_node_->second(2));
+    was_constant_set_ = false;
+  }
+
+  // populate contraint for static initial pose; with pose priors anchoring
+  // the graph the gauge does not need to be fixed (unless requested)
+  if ((gauge_fix_first_node_ || prior_blocks_->empty()) &&
+      !was_constant_set_ && first_node_ != nodes_->end() &&
       problem_->HasParameterBlock(&first_node_->second(0)) &&
       problem_->HasParameterBlock(&first_node_->second(1)) &&
       problem_->HasParameterBlock(&first_node_->second(2))) {
@@ -266,6 +323,38 @@ void CeresSolver::Compute()
     pose.SetHeading(iter->second(2));
     corrections_.push_back(std::make_pair(iter->first, pose));
   }
+
+  // report how well the optimized poses agree with the absolute pose priors
+  if (!prior_blocks_->empty()) {
+    std::vector<double> residuals;
+    residuals.reserve(prior_blocks_->size());
+    double sum = 0.0;
+    size_t outliers = 0;
+    for (const auto & prior : *prior_blocks_) {
+      ConstGraphIterator node = nodes_->find(prior.first);
+      if (node == nodes_->end()) {
+        continue;
+      }
+      const double residual =
+        (node->second.head<2>() - prior.second.second).norm();
+      residuals.push_back(residual);
+      sum += residual;
+      if (residual > 0.5) {
+        outliers++;
+      }
+    }
+    if (!residuals.empty()) {
+      std::sort(residuals.begin(), residuals.end());
+      const double p95 = residuals[static_cast<size_t>(
+            0.95 * (residuals.size() - 1))];
+      RCLCPP_INFO(
+        logger_,
+        "CeresSolver: pose prior residuals over %zu nodes: "
+        "mean %.3f m, p95 %.3f m, max %.3f m, %zu over 0.5 m.",
+        residuals.size(), sum / residuals.size(), p95,
+        residuals.back(), outliers);
+    }
+  }
 }
 
 /*****************************************************************************/
@@ -305,8 +394,14 @@ void CeresSolver::Reset()
     delete blocks_;
   }
 
+  if (prior_blocks_) {
+    delete prior_blocks_;
+  }
+
   nodes_ = new std::unordered_map<int, Eigen::Vector3d>();
   blocks_ = new std::unordered_map<std::size_t, ceres::ResidualBlockId>();
+  prior_blocks_ = new std::unordered_map<int,
+      std::pair<ceres::ResidualBlockId, Eigen::Vector2d>>();
   problem_ = new ceres::Problem(options_problem_);
   first_node_ = nodes_->end();
 
@@ -332,6 +427,78 @@ void CeresSolver::AddNode(karto::Vertex<karto::LocalizedRangeScan> * pVertex)
 
   if (nodes_->size() == 1) {
     first_node_ = nodes_->find(id);
+  }
+
+  if (pVertex->GetObject()->HasPosePrior()) {
+    AddPriorBlockLocked(id, pVertex->GetObject());
+  }
+}
+
+/*****************************************************************************/
+void CeresSolver::AddPriorBlockLocked(int id, karto::LocalizedRangeScan * pScan)
+/*****************************************************************************/
+{
+  GraphIterator nodeit = nodes_->find(id);
+  if (nodeit == nodes_->end()) {
+    RCLCPP_WARN(
+      logger_,
+      "CeresSolver: Failed to add pose prior, could not find node %d.", id);
+    return;
+  }
+
+  const karto::Pose2 & prior = pScan->GetPriorPose();
+  const karto::Matrix3 & rCov = pScan->GetPriorCovariance();
+  Eigen::Matrix3d covariance;
+  for (int i = 0; i < 3; i++) {
+    for (int j = 0; j < 3; j++) {
+      covariance(i, j) = rCov(i, j);
+    }
+  }
+
+  // A heading variance at or above the sentinel marks a position-only prior:
+  // the heading row/column of the information matrix is zeroed instead of
+  // inverting a near-singular covariance.
+  constexpr double kPositionOnlyYawVariance = 1e5;
+  Eigen::Matrix3d sqrt_information = Eigen::Matrix3d::Zero();
+  if (covariance(2, 2) >= kPositionOnlyYawVariance) {
+    sqrt_information.topLeftCorner<2, 2>() =
+      Eigen::Matrix2d(covariance.topLeftCorner<2, 2>().inverse())
+      .llt().matrixU();
+  } else {
+    sqrt_information =
+      Eigen::Matrix3d(covariance.inverse()).llt().matrixU();
+  }
+
+  ceres::CostFunction * cost_function = PosePrior2dErrorTerm::Create(
+    prior.GetX(), prior.GetY(), prior.GetHeading(), sqrt_information);
+  ceres::ResidualBlockId block = problem_->AddResidualBlock(
+    cost_function, prior_loss_function_,
+    &nodeit->second(0), &nodeit->second(1), &nodeit->second(2));
+  problem_->SetManifold(&nodeit->second(2), angle_manifold_);
+
+  (*prior_blocks_)[id] = std::make_pair(
+    block, Eigen::Vector2d(prior.GetX(), prior.GetY()));
+}
+
+/*****************************************************************************/
+void CeresSolver::UpdatePosePrior(
+  karto::Vertex<karto::LocalizedRangeScan> * pVertex)
+/*****************************************************************************/
+{
+  if (!pVertex) {
+    return;
+  }
+
+  boost::mutex::scoped_lock lock(nodes_mutex_);
+  const int id = pVertex->GetObject()->GetUniqueId();
+  auto prior_it = prior_blocks_->find(id);
+  if (prior_it != prior_blocks_->end()) {
+    problem_->RemoveResidualBlock(prior_it->second.first);
+    prior_blocks_->erase(prior_it);
+  }
+
+  if (pVertex->GetObject()->HasPosePrior()) {
+    AddPriorBlockLocked(id, pVertex->GetObject());
   }
 }
 
@@ -416,6 +583,8 @@ void CeresSolver::RemoveNode(kt_int32s id)
         "RemoveNode: Missing parameter blocks for "
         "node id %d", nodeit->first);
     }
+    // removing the parameter blocks already removed the prior residual
+    prior_blocks_->erase(id);
     nodes_->erase(nodeit);
   } else {
     RCLCPP_ERROR(

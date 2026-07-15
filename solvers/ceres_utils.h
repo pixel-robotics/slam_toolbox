@@ -126,4 +126,52 @@ private:
   const Eigen::Matrix3d sqrt_information_;
 };
 
+/*****************************************************************************/
+/*****************************************************************************/
+/*****************************************************************************/
+
+class PosePrior2dErrorTerm
+{
+public:
+  PosePrior2dErrorTerm(
+    double x, double y, double yaw_radians,
+    const Eigen::Matrix3d & sqrt_information)
+  : p_(x, y), yaw_radians_(yaw_radians), sqrt_information_(sqrt_information)
+  {
+  }
+
+  template<typename T>
+  bool operator()(
+    const T * const x, const T * const y, const T * const yaw,
+    T * residuals_ptr) const
+  {
+    Eigen::Map<Eigen::Matrix<T, 3, 1>> residuals_map(residuals_ptr);
+    residuals_map(0) = *x - static_cast<T>(p_(0));
+    residuals_map(1) = *y - static_cast<T>(p_(1));
+    residuals_map(2) = NormalizeAngle(*yaw - static_cast<T>(yaw_radians_));
+    // Scale the residuals by the square root information
+    // matrix to account for the measurement uncertainty.
+    residuals_map = sqrt_information_.template cast<T>() * residuals_map;
+    return true;
+  }
+
+  static ceres::CostFunction * Create(
+    double x, double y, double yaw_radians,
+    const Eigen::Matrix3d & sqrt_information)
+  {
+    return new ceres::AutoDiffCostFunction<PosePrior2dErrorTerm, 3, 1, 1, 1>(
+      new PosePrior2dErrorTerm(x, y, yaw_radians, sqrt_information));
+  }
+
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+private:
+  // The prior position of the node in the map frame.
+  const Eigen::Vector2d p_;
+  // The prior orientation of the node in the map frame.
+  const double yaw_radians_;
+  // The inverse square root of the prior covariance matrix.
+  const Eigen::Matrix3d sqrt_information_;
+};
+
 #endif  // SOLVERS__CERES_UTILS_H_

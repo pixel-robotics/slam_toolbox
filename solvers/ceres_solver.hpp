@@ -57,8 +57,12 @@ public:
   virtual void ModifyNode(const int & unique_id, Eigen::Vector3d pose);
   // get a node's current pose yaw
   virtual void GetNodeOrientation(const int & unique_id, double & pose);
+  // re-create a node's absolute pose prior residual from its scan
+  virtual void UpdatePosePrior(karto::Vertex<karto::LocalizedRangeScan> * pVertex);
 
 private:
+  // adds the prior residual block of a node; nodes_mutex_ must be held
+  void AddPriorBlockLocked(int id, karto::LocalizedRangeScan * pScan);
   // karto
   karto::ScanSolver::IdPoseVector corrections_;
 
@@ -66,13 +70,18 @@ private:
   ceres::Solver::Options options_;
   ceres::Problem::Options options_problem_;
   ceres::LossFunction * loss_function_;
+  ceres::LossFunction * prior_loss_function_;
   ceres::Problem * problem_;
   ceres::Manifold * angle_manifold_;
   bool was_constant_set_, debug_logging_;
+  bool gauge_fix_first_node_;
 
   // graph
   std::unordered_map<int, Eigen::Vector3d> * nodes_;
   std::unordered_map<size_t, ceres::ResidualBlockId> * blocks_;
+  // per-node absolute pose prior residuals: id -> (block, prior position)
+  std::unordered_map<int,
+    std::pair<ceres::ResidualBlockId, Eigen::Vector2d>> * prior_blocks_;
   std::unordered_map<int, Eigen::Vector3d>::iterator first_node_;
   boost::mutex nodes_mutex_;
 
