@@ -1267,6 +1267,13 @@ void SlamToolbox::loadSerializedPoseGraph(
 {
   boost::mutex::scoped_lock lock(smapper_mutex_);
 
+  if (!mapper || !mapper->GetGraph()) {
+    RCLCPP_FATAL(get_logger(),
+      "loadSerializedPoseGraph: serialized file did not contain a valid "
+      "pose graph (empty, truncated or incompatible). Refusing to load.");
+    return;
+  }
+
   solver_->Reset();
 
   // add the nodes and constraints to the optimizer
