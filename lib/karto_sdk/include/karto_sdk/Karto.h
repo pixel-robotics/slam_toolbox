@@ -29,6 +29,7 @@
 #include <boost/serialization/nvp.hpp>
 #include <boost/serialization/utility.hpp>
 #include <boost/serialization/export.hpp>
+#include <boost/serialization/version.hpp>
 #include <boost/type_traits/is_abstract.hpp>
 #include <boost/archive/binary_iarchive.hpp>
 #include <boost/archive/binary_oarchive.hpp>
@@ -5636,6 +5637,84 @@ public:
     }
   }
 
+  /**
+   * Sets an absolute pose prior for this scan, e.g. from an external
+   * localization system with surveyed anchors (GPS, ceiling cameras, ...).
+   * @param rPriorPose prior robot pose in the map frame
+   * @param rPriorCovariance covariance of the prior over (x, y, heading)
+   * @param rSourceId identifier of the anchor that produced the prior
+   * @param rAnchorPosition world position of that anchor when the prior was computed
+   */
+  inline void SetPosePrior(
+    const Pose2 & rPriorPose, const Matrix3 & rPriorCovariance,
+    const std::string & rSourceId = "",
+    const Vector2<kt_double> & rAnchorPosition = Vector2<kt_double>())
+  {
+    m_PriorPose = rPriorPose;
+    m_PriorCovariance = rPriorCovariance;
+    m_PriorSourceId = rSourceId;
+    m_PriorAnchorPosition = rAnchorPosition;
+    m_HasPosePrior = true;
+  }
+
+  /**
+   * Whether an absolute pose prior has been set for this scan
+   */
+  inline kt_bool HasPosePrior() const
+  {
+    return m_HasPosePrior;
+  }
+
+  /**
+   * Gets the absolute pose prior of this scan (valid only if HasPosePrior())
+   */
+  inline const Pose2 & GetPriorPose() const
+  {
+    return m_PriorPose;
+  }
+
+  /**
+   * Gets the covariance of the pose prior over (x, y, heading)
+   */
+  inline const Matrix3 & GetPriorCovariance() const
+  {
+    return m_PriorCovariance;
+  }
+
+  /**
+   * Gets the identifier of the anchor that produced the prior
+   */
+  inline const std::string & GetPriorSourceId() const
+  {
+    return m_PriorSourceId;
+  }
+
+  /**
+   * Gets the anchor world position the prior was computed from
+   */
+  inline const Vector2<kt_double> & GetPriorAnchorPosition() const
+  {
+    return m_PriorAnchorPosition;
+  }
+
+  /**
+   * Shifts the pose prior by the given delta and records the new anchor
+   * position; used when the anchor that produced the prior was re-surveyed.
+   */
+  inline void ShiftPosePrior(const Vector2<kt_double> & rDelta)
+  {
+    m_PriorPose = Pose2(m_PriorPose.GetPosition() + rDelta, m_PriorPose.GetHeading());
+    m_PriorAnchorPosition += rDelta;
+  }
+
+  /**
+   * Removes the pose prior from this scan
+   */
+  inline void ClearPosePrior()
+  {
+    m_HasPosePrior = false;
+  }
+
 private:
   /**
    * Compute point readings based on range readings
@@ -5718,6 +5797,13 @@ private:
     ar & BOOST_SERIALIZATION_NVP(m_BoundingBox);
     ar & BOOST_SERIALIZATION_NVP(m_IsDirty);
     ar & BOOST_SERIALIZATION_BASE_OBJECT_NVP(LaserRangeScan);
+    if (version >= 1) {
+      ar & BOOST_SERIALIZATION_NVP(m_HasPosePrior);
+      ar & BOOST_SERIALIZATION_NVP(m_PriorPose);
+      ar & BOOST_SERIALIZATION_NVP(m_PriorCovariance);
+      ar & BOOST_SERIALIZATION_NVP(m_PriorSourceId);
+      ar & BOOST_SERIALIZATION_NVP(m_PriorAnchorPosition);
+    }
   }
 
 private:
@@ -5760,6 +5846,31 @@ protected:
    * Internal flag used to update point readings, barycenter and bounding box
    */
   kt_bool m_IsDirty;
+
+  /**
+   * Whether an absolute pose prior has been set for this scan
+   */
+  kt_bool m_HasPosePrior = false;
+
+  /**
+   * Absolute pose prior of the robot in the map frame
+   */
+  Pose2 m_PriorPose;
+
+  /**
+   * Covariance of the pose prior over (x, y, heading)
+   */
+  Matrix3 m_PriorCovariance;
+
+  /**
+   * Identifier of the anchor that produced the prior
+   */
+  std::string m_PriorSourceId;
+
+  /**
+   * World position of the anchor when the prior was computed
+   */
+  Vector2<kt_double> m_PriorAnchorPosition;
 };    // LocalizedRangeScan
 
 /**
@@ -7018,6 +7129,8 @@ BOOST_CLASS_EXPORT_KEY(karto::Sensor);
 BOOST_CLASS_EXPORT_KEY(karto::Name);
 BOOST_CLASS_EXPORT_KEY(karto::SensorData);
 BOOST_CLASS_EXPORT_KEY(karto::LocalizedRangeScan);
+// Version 1 adds the absolute pose prior fields (m_HasPosePrior et al.).
+BOOST_CLASS_VERSION(karto::LocalizedRangeScan, 1)
 BOOST_CLASS_EXPORT_KEY(karto::LaserRangeScan);
 BOOST_CLASS_EXPORT_KEY(karto::LaserRangeFinder);
 BOOST_CLASS_EXPORT_KEY(karto::CustomData);

@@ -1016,6 +1016,14 @@ public:
   }
 
   /**
+   * Re-creates a node's absolute pose prior residual from its scan,
+   * e.g. after the prior was shifted or cleared
+   */
+  virtual void UpdatePosePrior(Vertex<LocalizedRangeScan> * /*pVertex*/)
+  {
+  }
+
+  /**
    * Resets the solver
    */
   virtual void Clear()
