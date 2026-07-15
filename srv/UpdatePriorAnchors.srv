@@ -1,0 +1,8 @@
+# Current surveyed positions of pose prior anchors, keyed by source id.
+# Nodes whose stored anchor position differs are shifted by the difference
+# (new positions are authoritative) and the pose graph is re-optimized.
+string[] source_ids
+geometry_msgs/Point[] positions
+---
+# Number of nodes whose priors were shifted
+int32 updated_count

@@ -102,6 +102,7 @@ CallbackReturn SlamToolbox::on_configure(const rclcpp_lifecycle::State &)
   RCLCPP_INFO(get_logger(), "Configuring");
   processor_type_ = PROCESS;
   first_measurement_ = true;
+  first_scan_processed_ = false;
   process_near_pose_ = nullptr;
   smapper_ = std::make_unique<mapper_utils::SMapper>();
   dataset_ = std::make_unique<Dataset>();
@@ -196,6 +197,8 @@ CallbackReturn SlamToolbox::on_deactivate(const rclcpp_lifecycle::State &)
   sst_.reset();
   pose_pub_.reset();
   ssReset_.reset();
+  prior_sub_.reset();
+  ssPriorAnchors_.reset();
 
   if (use_lifecycle_manager_) {
     // destroy bond connection
@@ -266,6 +269,8 @@ SlamToolbox::~SlamToolbox()
   sst_.reset();
   pose_pub_.reset();
   ssReset_.reset();
+  prior_sub_.reset();
+  ssPriorAnchors_.reset();
 
   tfB_.reset();
   tfL_.reset();
@@ -417,6 +422,46 @@ void SlamToolbox::setParams()
   check_min_dist_and_heading_precisely_ =
     this->get_parameter("check_min_dist_and_heading_precisely").as_bool();
 
+  use_pose_priors_ = false;
+  if (!this->has_parameter("use_pose_priors")) {
+    this->declare_parameter("use_pose_priors", use_pose_priors_);
+  }
+  use_pose_priors_ = this->get_parameter("use_pose_priors").as_bool();
+
+  pose_prior_topic_ = std::string("/pose_prior");
+  if (!this->has_parameter("pose_prior_topic")) {
+    this->declare_parameter("pose_prior_topic", pose_prior_topic_);
+  }
+  pose_prior_topic_ = this->get_parameter("pose_prior_topic").as_string();
+
+  prior_max_time_offset_ = 0.15;
+  if (!this->has_parameter("prior_max_time_offset")) {
+    this->declare_parameter("prior_max_time_offset", prior_max_time_offset_);
+  }
+  prior_max_time_offset_ = this->get_parameter("prior_max_time_offset").as_double();
+
+  prior_odom_propagation_ = true;
+  if (!this->has_parameter("prior_odom_propagation")) {
+    this->declare_parameter("prior_odom_propagation", prior_odom_propagation_);
+  }
+  prior_odom_propagation_ = this->get_parameter("prior_odom_propagation").as_bool();
+
+  prior_seed_first_node_ = true;
+  if (!this->has_parameter("prior_seed_first_node")) {
+    this->declare_parameter("prior_seed_first_node", prior_seed_first_node_);
+  }
+  prior_seed_first_node_ = this->get_parameter("prior_seed_first_node").as_bool();
+
+  // karto only optimizes on loop closures; priors need periodic solves to
+  // pull the graph onto the anchors (cartographer: optimize_every_n_nodes)
+  prior_optimize_every_n_nodes_ = 35;
+  if (!this->has_parameter("prior_optimize_every_n_nodes")) {
+    this->declare_parameter(
+      "prior_optimize_every_n_nodes", prior_optimize_every_n_nodes_);
+  }
+  prior_optimize_every_n_nodes_ =
+    this->get_parameter("prior_optimize_every_n_nodes").as_int();
+
   bool debug = false;
   if (!this->has_parameter("debug_logging")) {
     this->declare_parameter("debug_logging", debug);
@@ -465,6 +510,15 @@ void SlamToolbox::setROSInterfaces()
     "slam_toolbox/reset",
     std::bind(&SlamToolbox::resetCallback, this,
     std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+  if (use_pose_priors_) {
+    prior_sub_ = this->create_subscription<slam_toolbox::msg::PosePrior>(
+      pose_prior_topic_, rclcpp::QoS(rclcpp::KeepLast(50)),
+      std::bind(&SlamToolbox::posePriorCallback, this, std::placeholders::_1));
+    ssPriorAnchors_ = this->create_service<slam_toolbox::srv::UpdatePriorAnchors>(
+      "slam_toolbox/update_prior_anchors",
+      std::bind(&SlamToolbox::updatePriorAnchorsCallback, this,
+      std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+  }
 
   scan_filter_sub_ =
     std::make_unique<message_filters::Subscriber<sensor_msgs::msg::LaserScan,
@@ -816,6 +870,157 @@ bool SlamToolbox::shouldProcessScan(
 }
 
 /*****************************************************************************/
+void SlamToolbox::posePriorCallback(
+  slam_toolbox::msg::PosePrior::ConstSharedPtr msg)
+/*****************************************************************************/
+{
+  RCLCPP_INFO_ONCE(get_logger(), "posePriorCallback: first pose prior "
+    "received (source %s).", msg->source_id.c_str());
+
+  boost::mutex::scoped_lock lock(prior_buffer_mutex_);
+  prior_buffer_.push_back(msg);
+
+  // drop observations too old to ever match a scan
+  const rclcpp::Time newest(msg->pose.header.stamp);
+  const rclcpp::Duration max_age = rclcpp::Duration::from_seconds(5.0);
+  while (!prior_buffer_.empty() &&
+    (prior_buffer_.size() > 200 ||
+    newest - rclcpp::Time(prior_buffer_.front()->pose.header.stamp) > max_age))
+  {
+    prior_buffer_.pop_front();
+  }
+}
+
+/*****************************************************************************/
+bool SlamToolbox::getPriorForScanTime(
+  const rclcpp::Time & t, karto::Pose2 & prior_pose,
+  karto::Matrix3 & prior_covariance, std::string & source_id,
+  karto::Vector2<kt_double> & anchor_position)
+/*****************************************************************************/
+{
+  slam_toolbox::msg::PosePrior::ConstSharedPtr best;
+  double best_offset = prior_max_time_offset_;
+  {
+    boost::mutex::scoped_lock lock(prior_buffer_mutex_);
+    for (const auto & prior : prior_buffer_) {
+      const double offset =
+        std::fabs((t - rclcpp::Time(prior->pose.header.stamp)).seconds());
+      if (offset <= best_offset) {
+        best_offset = offset;
+        best = prior;
+      }
+    }
+  }
+
+  if (!best) {
+    return false;
+  }
+
+  const geometry_msgs::msg::PoseWithCovariance & p = best->pose.pose;
+  prior_pose = Pose2(p.pose.position.x, p.pose.position.y,
+      tf2::getYaw(p.pose.orientation));
+
+  // bridge the time offset between the observation and the scan with odometry
+  if (prior_odom_propagation_ && best_offset > 1e-3) {
+    Pose2 odom_at_prior, odom_at_scan;
+    if (pose_helper_->getOdomPose(odom_at_prior, best->pose.header.stamp) &&
+      pose_helper_->getOdomPose(odom_at_scan, t))
+    {
+      const tf2::Transform delta =
+        smapper_->toTfPose(odom_at_prior).inverse() *
+        smapper_->toTfPose(odom_at_scan);
+      prior_pose = smapper_->toKartoPose(smapper_->toTfPose(prior_pose) * delta);
+    }
+  }
+
+  // guard against non-positive variances; a missing yaw variance means
+  // position-only (see the sentinel handling in the solver plugin)
+  const double var_x = p.covariance[0] > 0.0 ? p.covariance[0] : 1e-4;
+  const double var_y = p.covariance[7] > 0.0 ? p.covariance[7] : 1e-4;
+  const double var_yaw = p.covariance[35] > 0.0 ? p.covariance[35] : 1e6;
+  prior_covariance.SetToIdentity();
+  prior_covariance(0, 0) = var_x;
+  prior_covariance(0, 1) = p.covariance[1];
+  prior_covariance(1, 0) = p.covariance[6];
+  prior_covariance(1, 1) = var_y;
+  prior_covariance(2, 2) = var_yaw;
+
+  source_id = best->source_id;
+  anchor_position = karto::Vector2<kt_double>(
+    best->anchor_position.x, best->anchor_position.y);
+
+  return true;
+}
+
+/*****************************************************************************/
+bool SlamToolbox::updatePriorAnchorsCallback(
+  const std::shared_ptr<rmw_request_id_t> request_header,
+  const std::shared_ptr<slam_toolbox::srv::UpdatePriorAnchors::Request> req,
+  std::shared_ptr<slam_toolbox::srv::UpdatePriorAnchors::Response> resp)
+/*****************************************************************************/
+{
+  resp->updated_count = 0;
+
+  if (req->source_ids.size() != req->positions.size()) {
+    RCLCPP_ERROR(get_logger(), "UpdatePriorAnchors: source_ids and positions "
+      "sizes differ (%zu vs %zu).", req->source_ids.size(),
+      req->positions.size());
+    return true;
+  }
+
+  std::map<std::string, karto::Vector2<kt_double>> anchors;
+  for (size_t i = 0; i != req->source_ids.size(); i++) {
+    anchors[req->source_ids[i]] = karto::Vector2<kt_double>(
+      req->positions[i].x, req->positions[i].y);
+  }
+
+  boost::mutex::scoped_lock lock(smapper_mutex_);
+  if (!smapper_ || !smapper_->getMapper() ||
+    !smapper_->getMapper()->GetGraph())
+  {
+    RCLCPP_WARN(get_logger(), "UpdatePriorAnchors: no pose graph to update.");
+    return true;
+  }
+
+  VerticeMap vertices = smapper_->getMapper()->GetGraph()->GetVertices();
+  for (VerticeMap::iterator sensor_it = vertices.begin();
+    sensor_it != vertices.end(); ++sensor_it)
+  {
+    for (ScanMap::iterator vertex_it = sensor_it->second.begin();
+      vertex_it != sensor_it->second.end(); ++vertex_it)
+    {
+      Vertex<LocalizedRangeScan> * vertex = vertex_it->second;
+      if (!vertex || !vertex->GetObject() ||
+        !vertex->GetObject()->HasPosePrior())
+      {
+        continue;
+      }
+      const auto anchor_it = anchors.find(
+        vertex->GetObject()->GetPriorSourceId());
+      if (anchor_it == anchors.end()) {
+        continue;
+      }
+      const karto::Vector2<kt_double> delta =
+        anchor_it->second - vertex->GetObject()->GetPriorAnchorPosition();
+      if (delta.Length() < 1e-3) {
+        continue;
+      }
+      vertex->GetObject()->ShiftPosePrior(delta);
+      solver_->UpdatePosePrior(vertex);
+      resp->updated_count++;
+    }
+  }
+
+  if (resp->updated_count > 0) {
+    RCLCPP_INFO(get_logger(), "UpdatePriorAnchors: shifted the priors of %d "
+      "nodes, re-optimizing.", resp->updated_count);
+    smapper_->getMapper()->CorrectPoses();
+  }
+
+  return true;
+}
+
+/*****************************************************************************/
 LocalizedRangeScan * SlamToolbox::addScan(
   LaserRangeFinder * laser,
   PosedScan & scan_w_pose)
@@ -835,6 +1040,25 @@ LocalizedRangeScan * SlamToolbox::addScan(
   LocalizedRangeScan * range_scan = getLocalizedRangeScan(
     laser, scan, odom_pose);
 
+  // attach an absolute pose prior if a matching observation is buffered
+  if (use_pose_priors_) {
+    Pose2 prior_pose;
+    Matrix3 prior_covariance;
+    std::string source_id;
+    karto::Vector2<kt_double> anchor_position;
+    if (getPriorForScanTime(scan->header.stamp, prior_pose, prior_covariance,
+      source_id, anchor_position))
+    {
+      range_scan->SetPosePrior(prior_pose, prior_covariance, source_id,
+        anchor_position);
+      attached_priors_++;
+      if (attached_priors_ == 1 || attached_priors_ % 100 == 0) {
+        RCLCPP_INFO(get_logger(), "addScan: attached pose prior #%d "
+          "(source %s).", attached_priors_, source_id.c_str());
+      }
+    }
+  }
+
   // Add the localized range scan to the smapper
   boost::mutex::scoped_lock lock(smapper_mutex_);
   bool processed = false, update_reprocessing_transform = false;
@@ -843,6 +1067,15 @@ LocalizedRangeScan * SlamToolbox::addScan(
   covariance.SetToIdentity();
 
   if (processor_type_ == PROCESS) {
+    // seed the very first node of a fresh map from the prior so the graph
+    // natively lives in the prior's (e.g. camera-world) frame
+    if (!first_scan_processed_ && prior_seed_first_node_ &&
+      range_scan->HasPosePrior())
+    {
+      range_scan->SetOdometricPose(range_scan->GetPriorPose());
+      range_scan->SetCorrectedPose(range_scan->GetPriorPose());
+      update_reprocessing_transform = true;
+    }
     processed = smapper_->getMapper()->Process(range_scan, &covariance);
   } else if (processor_type_ == PROCESS_FIRST_NODE) {
     processed = smapper_->getMapper()->ProcessAtDock(range_scan, &covariance);
@@ -871,6 +1104,17 @@ LocalizedRangeScan * SlamToolbox::addScan(
   // if successfully processed, create odom to map transformation
   // and add our scan to storage
   if (processed) {
+    first_scan_processed_ = true;
+
+    // periodic optimization so priors act between loop closures
+    // (CorrectPoses updates every scan in the graph, incl. range_scan)
+    if (use_pose_priors_ && prior_optimize_every_n_nodes_ > 0 &&
+      ++nodes_since_optimization_ >= prior_optimize_every_n_nodes_)
+    {
+      nodes_since_optimization_ = 0;
+      smapper_->getMapper()->CorrectPoses();
+    }
+
     if (enable_interactive_mode_) {
       scan_holder_->addScan(*scan);
     }
@@ -989,6 +1233,7 @@ void SlamToolbox::loadSerializedPoseGraph(
   solver_->Reset();
 
   // add the nodes and constraints to the optimizer
+  size_t restored_priors = 0;
   VerticeMap mapper_vertices = mapper->GetGraph()->GetVertices();
   VerticeMap::iterator vertex_map_it = mapper_vertices.begin();
   for (vertex_map_it; vertex_map_it != mapper_vertices.end(); ++vertex_map_it) {
@@ -996,9 +1241,17 @@ void SlamToolbox::loadSerializedPoseGraph(
     for (vertex_it; vertex_it != vertex_map_it->second.end(); ++vertex_it) {
       if (vertex_it->second != nullptr) {
         solver_->AddNode(vertex_it->second);
+        if (vertex_it->second->GetObject() &&
+          vertex_it->second->GetObject()->HasPosePrior())
+        {
+          restored_priors++;
+        }
       }
     }
   }
+  first_scan_processed_ = true;
+  RCLCPP_INFO(get_logger(),
+    "loadSerializedPoseGraph: restored %zu pose priors.", restored_priors);
 
   EdgeVector mapper_edges = mapper->GetGraph()->GetEdges();
   EdgeVector::iterator edges_it = mapper_edges.begin();

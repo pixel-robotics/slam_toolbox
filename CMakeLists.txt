@@ -103,7 +103,9 @@ include_directories(include lib/karto_sdk/include
 add_definitions(${EIGEN3_DEFINITIONS})
 
 rosidl_generate_interfaces(${PROJECT_NAME}
+  msg/PosePrior.msg
   srv/Pause.srv
+  srv/UpdatePriorAnchors.srv
   srv/Reset.srv
   srv/ClearQueue.srv
   srv/ToggleInteractive.srv
@@ -195,6 +197,12 @@ target_link_libraries(merge_maps_kinematic kartoSlamToolbox toolbox_common)
 #  ament_add_gtest(lifelong_metrics_test test/lifelong_metrics_test.cpp)
 #  target_link_libraries(lifelong_metrics_test lifelong_slam_toolbox)
 #endif()
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(pose_prior_test test/pose_prior_test.cpp)
+  target_link_libraries(pose_prior_test kartoSlamToolbox ${CERES_LIBRARIES})
+endif()
 
 rclcpp_components_register_nodes(async_slam_toolbox "slam_toolbox::AsynchronousSlamToolbox")
 rclcpp_components_register_nodes(sync_slam_toolbox "slam_toolbox::SynchronousSlamToolbox")

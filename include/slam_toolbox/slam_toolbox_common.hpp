@@ -25,6 +25,7 @@
 #include <map>
 #include <vector>
 #include <queue>
+#include <deque>
 #include <cstdlib>
 #include <memory>
 #include <fstream>
@@ -46,6 +47,8 @@
 
 #include "pluginlib/class_loader.hpp"
 
+#include "slam_toolbox/msg/pose_prior.hpp"
+#include "slam_toolbox/srv/update_prior_anchors.hpp"
 #include "slam_toolbox/toolbox_types.hpp"
 #include "slam_toolbox/slam_mapper.hpp"
 #include "slam_toolbox/snap_utils.hpp"
@@ -108,6 +111,11 @@ protected:
     const std::shared_ptr<rmw_request_id_t> request_header,
     const std::shared_ptr<slam_toolbox::srv::Reset::Request> req,
     std::shared_ptr<slam_toolbox::srv::Reset::Response> resp);
+  void posePriorCallback(slam_toolbox::msg::PosePrior::ConstSharedPtr msg);
+  bool updatePriorAnchorsCallback(
+    const std::shared_ptr<rmw_request_id_t> request_header,
+    const std::shared_ptr<slam_toolbox::srv::UpdatePriorAnchors::Request> req,
+    std::shared_ptr<slam_toolbox::srv::UpdatePriorAnchors::Response> resp);
 
   // Loaders
   void loadSerializedPoseGraph(std::unique_ptr<karto::Mapper> &, std::unique_ptr<karto::Dataset> &);
@@ -133,6 +141,10 @@ protected:
   bool shouldProcessScan(
     const sensor_msgs::msg::LaserScan::ConstSharedPtr & scan,
     const karto::Pose2 & pose);
+  bool getPriorForScanTime(
+    const rclcpp::Time & t, karto::Pose2 & prior_pose,
+    karto::Matrix3 & prior_covariance, std::string & source_id,
+    karto::Vector2<kt_double> & anchor_position);
   void publishPose(
     const Pose2 & pose,
     const Matrix3 & cov,
@@ -161,6 +173,8 @@ protected:
   std::shared_ptr<rclcpp::Service<slam_toolbox::srv::SerializePoseGraph>> ssSerialize_;
   std::shared_ptr<rclcpp::Service<slam_toolbox::srv::DeserializePoseGraph>> ssDesserialize_;
   std::shared_ptr<rclcpp::Service<slam_toolbox::srv::Reset>> ssReset_;
+  rclcpp::Subscription<slam_toolbox::msg::PosePrior>::SharedPtr prior_sub_;
+  std::shared_ptr<rclcpp::Service<slam_toolbox::srv::UpdatePriorAnchors>> ssPriorAnchors_;
 
   // Storage for ROS parameters
   std::string odom_frame_, map_frame_, base_frame_, map_name_, scan_topic_;
@@ -176,6 +190,16 @@ protected:
   bool first_measurement_, enable_interactive_mode_;
   bool restamp_tf_;
   bool check_min_dist_and_heading_precisely_;
+
+  // absolute pose priors
+  bool use_pose_priors_, prior_odom_propagation_, prior_seed_first_node_;
+  bool first_scan_processed_;
+  std::string pose_prior_topic_;
+  double prior_max_time_offset_;
+  int prior_optimize_every_n_nodes_;
+  int nodes_since_optimization_{0}, attached_priors_{0};
+  std::deque<slam_toolbox::msg::PosePrior::ConstSharedPtr> prior_buffer_;
+  boost::mutex prior_buffer_mutex_;
 
   // Book keeping
   std::unique_ptr<mapper_utils::SMapper> smapper_;
