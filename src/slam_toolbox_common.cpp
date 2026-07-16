@@ -473,6 +473,17 @@ void SlamToolbox::setParams()
   prior_reseed_jump_distance_ =
     this->get_parameter("prior_reseed_jump_distance").as_double();
 
+  // right after a jump the first scans typically precede the first prior
+  // (observation transport lag); hold off processing that long before
+  // falling back to scan matching
+  prior_reseed_wait_timeout_ = 10.0;
+  if (!this->has_parameter("prior_reseed_wait_timeout")) {
+    this->declare_parameter(
+      "prior_reseed_wait_timeout", prior_reseed_wait_timeout_);
+  }
+  prior_reseed_wait_timeout_ =
+    this->get_parameter("prior_reseed_wait_timeout").as_double();
+
   bool debug = false;
   if (!this->has_parameter("debug_logging")) {
     this->declare_parameter("debug_logging", debug);
@@ -1091,25 +1102,44 @@ LocalizedRangeScan * SlamToolbox::addScan(
       update_reprocessing_transform = true;
       processed = smapper_->getMapper()->Process(range_scan, &covariance);
     } else if (use_pose_priors_ && prior_reseed_jump_distance_ > 0.0 &&
-      jump > prior_reseed_jump_distance_ && range_scan->HasPosePrior())
+      jump > prior_reseed_jump_distance_)
     {
-      // re-attach to the graph at the prior instead of trusting scan
-      // matching across the jump
-      RCLCPP_WARN(get_logger(), "addScan: odometry jumped %.1f m; "
-        "re-seeding from pose prior (source %s).", jump,
-        range_scan->GetPriorSourceId().c_str());
-      range_scan->SetOdometricPose(range_scan->GetPriorPose());
-      range_scan->SetCorrectedPose(range_scan->GetPriorPose());
-      processed = smapper_->getMapper()->ProcessAgainstNodesNearBy(
-        range_scan, false, &covariance);
-      update_reprocessing_transform = true;
-    } else {
-      if (use_pose_priors_ && prior_reseed_jump_distance_ > 0.0 &&
-        jump > prior_reseed_jump_distance_)
-      {
-        RCLCPP_WARN(get_logger(), "addScan: odometry jumped %.1f m with no "
-          "pose prior available; trusting scan matching.", jump);
+      if (range_scan->HasPosePrior()) {
+        // re-attach to the graph at the prior instead of trusting scan
+        // matching across the jump
+        RCLCPP_WARN(get_logger(), "addScan: odometry jumped %.1f m; "
+          "re-seeding from pose prior (source %s).", jump,
+          range_scan->GetPriorSourceId().c_str());
+        range_scan->SetOdometricPose(range_scan->GetPriorPose());
+        range_scan->SetCorrectedPose(range_scan->GetPriorPose());
+        processed = smapper_->getMapper()->ProcessAgainstNodesNearBy(
+          range_scan, false, &covariance);
+        update_reprocessing_transform = true;
+        reseed_waiting_ = false;
+      } else {
+        // the first scans after a jump typically precede the first prior
+        // (observation transport lag): hold off, retry on later scans
+        const rclcpp::Time stamp(scan->header.stamp);
+        if (!reseed_waiting_) {
+          reseed_waiting_ = true;
+          reseed_wait_start_ = stamp;
+        }
+        if ((stamp - reseed_wait_start_).seconds() <
+          prior_reseed_wait_timeout_)
+        {
+          RCLCPP_WARN(get_logger(), "addScan: odometry jumped %.1f m with "
+            "no pose prior yet; holding off (%.1f s).", jump,
+            (stamp - reseed_wait_start_).seconds());
+          // fall through unprocessed: the scan is dropped below
+        } else {
+          RCLCPP_WARN(get_logger(), "addScan: no pose prior %.1f s after a "
+            "%.1f m odometry jump; trusting scan matching.",
+            (stamp - reseed_wait_start_).seconds(), jump);
+          processed = smapper_->getMapper()->Process(range_scan, &covariance);
+          reseed_waiting_ = false;
+        }
       }
+    } else {
       processed = smapper_->getMapper()->Process(range_scan, &covariance);
     }
   } else if (processor_type_ == PROCESS_FIRST_NODE) {
@@ -1142,6 +1172,7 @@ LocalizedRangeScan * SlamToolbox::addScan(
     first_scan_processed_ = true;
     last_processed_odom_pose_ = range_scan->GetOdometricPose();
     last_processed_odom_valid_ = true;
+    reseed_waiting_ = false;
 
     // periodic optimization so priors act between loop closures
     // (CorrectPoses updates every scan in the graph, incl. range_scan)

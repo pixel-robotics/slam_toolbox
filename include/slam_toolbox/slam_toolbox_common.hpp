@@ -197,10 +197,13 @@ protected:
   std::string pose_prior_topic_;
   double prior_max_time_offset_;
   double prior_reseed_jump_distance_;
+  double prior_reseed_wait_timeout_;
   int prior_optimize_every_n_nodes_;
   int nodes_since_optimization_{0}, attached_priors_{0};
   karto::Pose2 last_processed_odom_pose_;
   bool last_processed_odom_valid_{false};
+  bool reseed_waiting_{false};
+  rclcpp::Time reseed_wait_start_;
   std::deque<slam_toolbox::msg::PosePrior::ConstSharedPtr> prior_buffer_;
   boost::mutex prior_buffer_mutex_;
 
