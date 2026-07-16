@@ -161,13 +161,21 @@ void OfflineSlamToolbox::reanchorFromBagPriors()
     const rclcpp::SerializedMessage serialized(*bag_msg->serialized_data);
     slam_toolbox::msg::PosePrior prior;
     prior_serde.deserialize_message(&serialized, &prior);
+    // anchor_position (0, 0) marks an unanchored prior (the producer had no
+    // survey info) - it carries no re-survey evidence, so it must not shift
+    // stored priors of the same source
+    if (std::abs(prior.anchor_position.x) < 1e-9 &&
+      std::abs(prior.anchor_position.y) < 1e-9)
+    {
+      continue;
+    }
     anchors.emplace(prior.source_id, karto::Vector2<kt_double>(
         prior.anchor_position.x, prior.anchor_position.y));
   }
 
   if (anchors.empty()) {
     RCLCPP_WARN(get_logger(), "offline: continuing a pose graph but the bag "
-      "has no %s messages - stale anchors cannot be updated.",
+      "has no anchored %s messages - stale anchors cannot be updated.",
       pose_prior_topic_.c_str());
     return;
   }

@@ -8,6 +8,9 @@ geometry_msgs/PoseWithCovarianceStamped pose
 # Identifier of the anchor that produced this prior (e.g. "camera_7").
 string source_id
 
-# World position of that anchor when this prior was computed; stored with
-# the node so priors can be shifted if the anchor is later re-surveyed.
+# Optional: world position of that anchor when this prior was computed;
+# stored with the node so priors can be shifted if the anchor is later
+# re-surveyed (UpdatePriorAnchors service / the offline node's bag
+# pre-scan). Leave at (0, 0) when the producer has no survey info -
+# unanchored priors are excluded from re-anchoring in both directions.
 geometry_msgs/Point anchor_position

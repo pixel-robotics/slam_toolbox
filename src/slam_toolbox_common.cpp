@@ -1162,6 +1162,11 @@ int SlamToolbox::applyPriorAnchorUpdates(
       if (anchor_it == anchors.end()) {
         continue;
       }
+      // a stored (0, 0) anchor means the prior was attached without survey
+      // info - there is no baseline to diff against, so never shift it
+      if (vertex->GetObject()->GetPriorAnchorPosition().Length() < 1e-9) {
+        continue;
+      }
       const karto::Vector2<kt_double> delta =
         anchor_it->second - vertex->GetObject()->GetPriorAnchorPosition();
       if (delta.Length() < 1e-3) {
