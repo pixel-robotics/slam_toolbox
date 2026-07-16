@@ -330,6 +330,9 @@ void CeresSolver::Compute()
     residuals.reserve(prior_blocks_->size());
     double sum = 0.0;
     size_t outliers = 0;
+    int worst_node = -1;
+    double worst_residual = -1.0;
+    Eigen::Vector2d worst_prior_position(0.0, 0.0);
     for (const auto & prior : *prior_blocks_) {
       ConstGraphIterator node = nodes_->find(prior.first);
       if (node == nodes_->end()) {
@@ -342,6 +345,11 @@ void CeresSolver::Compute()
       if (residual > 0.5) {
         outliers++;
       }
+      if (residual > worst_residual) {
+        worst_residual = residual;
+        worst_node = prior.first;
+        worst_prior_position = prior.second.second;
+      }
     }
     if (!residuals.empty()) {
       std::sort(residuals.begin(), residuals.end());
@@ -350,9 +358,11 @@ void CeresSolver::Compute()
       RCLCPP_INFO(
         logger_,
         "CeresSolver: pose prior residuals over %zu nodes: "
-        "mean %.3f m, p95 %.3f m, max %.3f m, %zu over 0.5 m.",
+        "mean %.3f m, p95 %.3f m, max %.3f m, %zu over 0.5 m; "
+        "worst node %d (prior at %.1f, %.1f).",
         residuals.size(), sum / residuals.size(), p95,
-        residuals.back(), outliers);
+        residuals.back(), outliers, worst_node,
+        worst_prior_position.x(), worst_prior_position.y());
     }
   }
 }

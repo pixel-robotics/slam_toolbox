@@ -473,6 +473,19 @@ void SlamToolbox::setParams()
   prior_reseed_jump_distance_ =
     this->get_parameter("prior_reseed_jump_distance").as_double();
 
+  // odometry can also be wrong without jumping (wheel slip, an offline bag
+  // whose gap bridge under-estimated motion): re-seed when the prior
+  // disagrees with the odometry-predicted pose by this much on two distinct
+  // consecutive fixes. Must sit well above camera-fix outlier scale (~2 m)
+  // and below real slip/bridge errors (10+ m). 0 disables.
+  prior_reseed_divergence_distance_ = 6.0;
+  if (!this->has_parameter("prior_reseed_divergence_distance")) {
+    this->declare_parameter(
+      "prior_reseed_divergence_distance", prior_reseed_divergence_distance_);
+  }
+  prior_reseed_divergence_distance_ =
+    this->get_parameter("prior_reseed_divergence_distance").as_double();
+
   // right after a jump the first scans typically precede the first prior
   // (observation transport lag); hold off processing that long before
   // falling back to scan matching
@@ -975,6 +988,122 @@ bool SlamToolbox::getPriorForScanTime(
 }
 
 /*****************************************************************************/
+bool SlamToolbox::lastTwoPriorsConsistent()
+/*****************************************************************************/
+{
+  slam_toolbox::msg::PosePrior::ConstSharedPtr older, newer;
+  {
+    boost::mutex::scoped_lock lock(prior_buffer_mutex_);
+    if (prior_buffer_.size() < 2) {
+      return false;
+    }
+    newer = prior_buffer_.back();
+    older = prior_buffer_[prior_buffer_.size() - 2];
+  }
+
+  karto::Pose2 pose_older(
+    older->pose.pose.pose.position.x, older->pose.pose.pose.position.y,
+    tf2::getYaw(older->pose.pose.pose.orientation));
+  const karto::Pose2 pose_newer(
+    newer->pose.pose.pose.position.x, newer->pose.pose.pose.position.y,
+    tf2::getYaw(newer->pose.pose.pose.orientation));
+
+  // bridge the robot motion between the two fixes with odometry; if TF
+  // cannot cover both stamps fall back to the raw distance (the fixes are
+  // ~1 s apart, so genuine motion between them stays small either way)
+  karto::Pose2 odom_older, odom_newer;
+  if (pose_helper_->getOdomPose(odom_older, older->pose.header.stamp) &&
+    pose_helper_->getOdomPose(odom_newer, newer->pose.header.stamp))
+  {
+    const tf2::Transform delta =
+      smapper_->toTfPose(odom_older).inverse() *
+      smapper_->toTfPose(odom_newer);
+    pose_older = smapper_->toKartoPose(smapper_->toTfPose(pose_older) * delta);
+  }
+
+  return (pose_older.GetPosition() - pose_newer.GetPosition()).Length() < 2.0;
+}
+
+/*****************************************************************************/
+bool SlamToolbox::updatePriorDivergence(
+  karto::LocalizedRangeScan * range_scan, double & prior_divergence)
+/*****************************************************************************/
+{
+  // odometry can be wrong without jumping: wheel slip, or a stitched bag
+  // whose gap bridge under-estimated the motion. The attached prior is
+  // surveyed ground truth, so compare it against where the odometry delta
+  // predicts this scan will land (drift-free, unlike odom vs prior
+  // directly). Require two consecutive corroborating divergent fixes so a
+  // single outlier camera fix cannot hijack the re-seed.
+  prior_divergence = 0.0;
+  if (!use_pose_priors_ || prior_reseed_divergence_distance_ <= 0.0 ||
+    !range_scan->HasPosePrior() ||
+    !last_processed_odom_valid_ || !first_scan_processed_)
+  {
+    // a scan without a prior carries no evidence either way: leave the
+    // suppression latch and the corroboration counter untouched
+    return false;
+  }
+
+  const tf2::Transform delta =
+    smapper_->toTfPose(last_processed_odom_pose_).inverse() *
+    smapper_->toTfPose(range_scan->GetOdometricPose());
+  const karto::Pose2 predicted = smapper_->toKartoPose(
+    smapper_->toTfPose(last_processed_corrected_pose_) * delta);
+  prior_divergence =
+    (range_scan->GetPriorPose().GetPosition() -
+    predicted.GetPosition()).Length();
+
+  if (prior_divergence_suppressed_) {
+    if (prior_divergence < prior_reseed_divergence_distance_) {
+      prior_divergence_suppressed_ = false;  // they agree again
+    } else {
+      return false;  // conflict already adjudicated to odometry
+    }
+  }
+
+  const bool diverged =
+    prior_divergence > prior_reseed_divergence_distance_;
+  if (!diverged) {
+    prior_divergence_hits_ = 0;
+  } else if (prior_divergence_hits_ > 0 &&
+    (range_scan->GetPriorPose().GetPosition() -
+    last_divergence_prior_pose_.GetPosition()).Length() < 2.0)
+  {
+    // the new hit corroborates the previous one: consecutive processed
+    // scans are <1 m apart, so genuine odometry failure gives nearby prior
+    // poses, while scattered outlier fixes disagree with each other
+    prior_divergence_hits_++;
+    last_divergence_prior_pose_ = range_scan->GetPriorPose();
+  } else {
+    prior_divergence_hits_ = 1;  // first or conflicting fix
+    last_divergence_prior_pose_ = range_scan->GetPriorPose();
+  }
+
+  return diverged;
+}
+
+/*****************************************************************************/
+bool SlamToolbox::reseedFromPrior(
+  karto::LocalizedRangeScan * range_scan, karto::Matrix3 & covariance)
+/*****************************************************************************/
+{
+  range_scan->SetOdometricPose(range_scan->GetPriorPose());
+  range_scan->SetCorrectedPose(range_scan->GetPriorPose());
+  const bool processed = smapper_->getMapper()->ProcessAgainstNodesNearBy(
+    range_scan, false, &covariance);
+  RCLCPP_WARN(get_logger(), "addScan: re-seed %s: seed (%.1f, %.1f) "
+    "-> corrected (%.1f, %.1f).",
+    processed ? "processed" : "REJECTED",
+    range_scan->GetPriorPose().GetX(), range_scan->GetPriorPose().GetY(),
+    range_scan->GetCorrectedPose().GetX(),
+    range_scan->GetCorrectedPose().GetY());
+  reseed_waiting_ = false;
+  prior_divergence_hits_ = 0;
+  return processed;
+}
+
+/*****************************************************************************/
 bool SlamToolbox::updatePriorAnchorsCallback(
   const std::shared_ptr<rmw_request_id_t> request_header,
   const std::shared_ptr<slam_toolbox::srv::UpdatePriorAnchors::Request> req,
@@ -996,12 +1125,23 @@ bool SlamToolbox::updatePriorAnchorsCallback(
       req->positions[i].x, req->positions[i].y);
   }
 
+  resp->updated_count = applyPriorAnchorUpdates(anchors);
+  return true;
+}
+
+/*****************************************************************************/
+int SlamToolbox::applyPriorAnchorUpdates(
+  const std::map<std::string, karto::Vector2<kt_double>> & anchors)
+/*****************************************************************************/
+{
+  int updated_count = 0;
+
   boost::mutex::scoped_lock lock(smapper_mutex_);
   if (!smapper_ || !smapper_->getMapper() ||
     !smapper_->getMapper()->GetGraph())
   {
     RCLCPP_WARN(get_logger(), "UpdatePriorAnchors: no pose graph to update.");
-    return true;
+    return 0;
   }
 
   VerticeMap vertices = smapper_->getMapper()->GetGraph()->GetVertices();
@@ -1029,17 +1169,17 @@ bool SlamToolbox::updatePriorAnchorsCallback(
       }
       vertex->GetObject()->ShiftPosePrior(delta);
       solver_->UpdatePosePrior(vertex);
-      resp->updated_count++;
+      updated_count++;
     }
   }
 
-  if (resp->updated_count > 0) {
+  if (updated_count > 0) {
     RCLCPP_INFO(get_logger(), "UpdatePriorAnchors: shifted the priors of %d "
-      "nodes, re-optimizing.", resp->updated_count);
+      "nodes, re-optimizing.", updated_count);
     smapper_->getMapper()->CorrectPoses();
   }
 
-  return true;
+  return updated_count;
 }
 
 /*****************************************************************************/
@@ -1092,6 +1232,12 @@ LocalizedRangeScan * SlamToolbox::addScan(
     const double jump = last_processed_odom_valid_ ?
       (range_scan->GetOdometricPose().GetPosition() -
       last_processed_odom_pose_.GetPosition()).Length() : 0.0;
+
+    double prior_divergence = 0.0;
+    const bool diverged = updatePriorDivergence(range_scan, prior_divergence);
+    const bool jumped = prior_reseed_jump_distance_ > 0.0 &&
+      jump > prior_reseed_jump_distance_;
+
     if (!first_scan_processed_ && prior_seed_first_node_ &&
       range_scan->HasPosePrior())
     {
@@ -1101,21 +1247,27 @@ LocalizedRangeScan * SlamToolbox::addScan(
       range_scan->SetCorrectedPose(range_scan->GetPriorPose());
       update_reprocessing_transform = true;
       processed = smapper_->getMapper()->Process(range_scan, &covariance);
-    } else if (use_pose_priors_ && prior_reseed_jump_distance_ > 0.0 &&
-      jump > prior_reseed_jump_distance_)
-    {
-      if (range_scan->HasPosePrior()) {
-        // re-attach to the graph at the prior instead of trusting scan
-        // matching across the jump
-        RCLCPP_WARN(get_logger(), "addScan: odometry jumped %.1f m; "
-          "re-seeding from pose prior (source %s).", jump,
+    } else if (use_pose_priors_ && (jumped || diverged)) {
+      // a single suspect scan must neither re-seed NOR be processed at the
+      // (suspect) odometry pose - it falls into the hold-off below until a
+      // second corroborating fix confirms which side is lying (a re-seed
+      // commits the graph to one fix, and a single mis-tracked detection
+      // must not be able to hijack it - bag 20260715 min 132: one phantom
+      // fix 45 m away re-attached a 43-node stretch; processing a divergent
+      // scan once left one permanent full-gap-residual node)
+      if (range_scan->HasPosePrior() &&
+        (jumped || prior_divergence_hits_ >= 2) &&
+        lastTwoPriorsConsistent())
+      {
+        RCLCPP_WARN(get_logger(), "addScan: odometry %s; "
+          "re-seeding from pose prior (source %s).",
+          jumped ?
+          (std::string("jumped ") + std::to_string(jump) + " m").c_str() :
+          (std::string("diverged ") + std::to_string(prior_divergence) +
+          " m from the prior").c_str(),
           range_scan->GetPriorSourceId().c_str());
-        range_scan->SetOdometricPose(range_scan->GetPriorPose());
-        range_scan->SetCorrectedPose(range_scan->GetPriorPose());
-        processed = smapper_->getMapper()->ProcessAgainstNodesNearBy(
-          range_scan, false, &covariance);
+        processed = reseedFromPrior(range_scan, covariance);
         update_reprocessing_transform = true;
-        reseed_waiting_ = false;
       } else {
         // the first scans after a jump typically precede the first prior
         // (observation transport lag): hold off, retry on later scans
@@ -1127,16 +1279,32 @@ LocalizedRangeScan * SlamToolbox::addScan(
         if ((stamp - reseed_wait_start_).seconds() <
           prior_reseed_wait_timeout_)
         {
-          RCLCPP_WARN(get_logger(), "addScan: odometry jumped %.1f m with "
-            "no pose prior yet; holding off (%.1f s).", jump,
+          RCLCPP_WARN(get_logger(), "addScan: odometry jumped %.1f m / "
+            "diverged %.1f m with no corroborated pose prior yet; holding "
+            "off (%.1f s).", jump, prior_divergence,
             (stamp - reseed_wait_start_).seconds());
           // fall through unprocessed: the scan is dropped below
+        } else if (range_scan->HasPosePrior()) {
+          // corroboration never arrived (sparse coverage: one camera, slow
+          // fix rate) - a single surveyed fix still beats odometry that is
+          // known-wrong across a jump/divergence, so re-seed from it late
+          // rather than committing a node at the suspect pose with a
+          // far-away prior attached
+          RCLCPP_WARN(get_logger(), "addScan: no corroborating second fix "
+            "%.1f s after a %.1f m jump / %.1f m divergence; re-seeding "
+            "from the single available prior (source %s).",
+            (stamp - reseed_wait_start_).seconds(), jump, prior_divergence,
+            range_scan->GetPriorSourceId().c_str());
+          processed = reseedFromPrior(range_scan, covariance);
+          update_reprocessing_transform = true;
         } else {
           RCLCPP_WARN(get_logger(), "addScan: no pose prior %.1f s after a "
-            "%.1f m odometry jump; trusting scan matching.",
-            (stamp - reseed_wait_start_).seconds(), jump);
+            "%.1f m jump / %.1f m divergence; trusting scan matching.",
+            (stamp - reseed_wait_start_).seconds(), jump, prior_divergence);
           processed = smapper_->getMapper()->Process(range_scan, &covariance);
           reseed_waiting_ = false;
+          prior_divergence_suppressed_ = true;
+          prior_divergence_hits_ = 0;
         }
       }
     } else {
@@ -1171,6 +1339,7 @@ LocalizedRangeScan * SlamToolbox::addScan(
   if (processed) {
     first_scan_processed_ = true;
     last_processed_odom_pose_ = range_scan->GetOdometricPose();
+    last_processed_corrected_pose_ = range_scan->GetCorrectedPose();
     last_processed_odom_valid_ = true;
     reseed_waiting_ = false;
 

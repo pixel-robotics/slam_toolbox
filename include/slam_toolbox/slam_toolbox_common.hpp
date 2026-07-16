@@ -116,6 +116,10 @@ protected:
     const std::shared_ptr<rmw_request_id_t> request_header,
     const std::shared_ptr<slam_toolbox::srv::UpdatePriorAnchors::Request> req,
     std::shared_ptr<slam_toolbox::srv::UpdatePriorAnchors::Response> resp);
+  // Shift the stored priors of every node whose source has a new anchor
+  // position and re-optimize; returns the number of shifted nodes.
+  int applyPriorAnchorUpdates(
+    const std::map<std::string, karto::Vector2<kt_double>> & anchors);
 
   // Loaders
   void loadSerializedPoseGraph(std::unique_ptr<karto::Mapper> &, std::unique_ptr<karto::Dataset> &);
@@ -145,6 +149,21 @@ protected:
     const rclcpp::Time & t, karto::Pose2 & prior_pose,
     karto::Matrix3 & prior_covariance, std::string & source_id,
     karto::Vector2<kt_double> & anchor_position);
+  // True when the two newest buffered priors agree after odometry
+  // propagation - a single outlier fix (mis-tracked AMR identity) must not
+  // be able to hijack a re-seed.
+  bool lastTwoPriorsConsistent();
+  // Divergence-trigger state update: computes how far the scan's prior sits
+  // from the odometry-predicted pose and maintains the corroboration
+  // counter / suppression latch. Scans without a prior carry no evidence
+  // and leave the state untouched. Returns true when divergence exceeds
+  // prior_reseed_divergence_distance (and is not suppressed).
+  bool updatePriorDivergence(
+    karto::LocalizedRangeScan * range_scan, double & prior_divergence);
+  // Re-attach the scan to the graph at its prior pose (call under
+  // smapper_mutex_); resets the re-seed wait and divergence state.
+  bool reseedFromPrior(
+    karto::LocalizedRangeScan * range_scan, karto::Matrix3 & covariance);
   void publishPose(
     const Pose2 & pose,
     const Matrix3 & cov,
@@ -197,11 +216,18 @@ protected:
   std::string pose_prior_topic_;
   double prior_max_time_offset_;
   double prior_reseed_jump_distance_;
+  double prior_reseed_divergence_distance_;
   double prior_reseed_wait_timeout_;
+  karto::Pose2 last_divergence_prior_pose_;
   int prior_optimize_every_n_nodes_;
   int nodes_since_optimization_{0}, attached_priors_{0};
   karto::Pose2 last_processed_odom_pose_;
+  karto::Pose2 last_processed_corrected_pose_;
   bool last_processed_odom_valid_{false};
+  int prior_divergence_hits_{0};
+  // set when a divergence hold-off timed out and we chose odometry over the
+  // priors; keeps the trigger from re-firing every scan until they agree again
+  bool prior_divergence_suppressed_{false};
   bool reseed_waiting_{false};
   rclcpp::Time reseed_wait_start_;
   std::deque<slam_toolbox::msg::PosePrior::ConstSharedPtr> prior_buffer_;

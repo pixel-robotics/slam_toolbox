@@ -41,6 +41,8 @@
   <build_depend>bondcpp</build_depend>
   <build_depend>bond</build_depend>
   <build_depend>rclcpp_lifecycle</build_depend>
+  <depend>rosbag2_cpp</depend>
+  <exec_depend>rosbag2_storage_mcap</exec_depend>
   <depend>rviz_common</depend>
   <depend>rviz_default_plugins</depend>
   <depend>rviz_ogre_vendor</depend>

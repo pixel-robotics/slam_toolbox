@@ -36,6 +36,7 @@ find_package(rviz_rendering REQUIRED)
 find_package(interactive_markers REQUIRED)
 find_package(Qt5 REQUIRED COMPONENTS Core Gui Widgets Test Concurrent)
 find_package(rclcpp_components REQUIRED)
+find_package(rosbag2_cpp REQUIRED)
 
 #karto_sdk lib
 set(BUILD_SHARED_LIBS ON)
@@ -68,6 +69,7 @@ set(dependencies
   interactive_markers
   Qt5
   rclcpp_components
+  rosbag2_cpp
 )
 
 set(libraries
@@ -75,6 +77,7 @@ set(libraries
     SlamToolboxPlugin
     ceres_solver_plugin
     async_slam_toolbox
+    offline_slam_toolbox
     sync_slam_toolbox
     localization_slam_toolbox
     lifelong_slam_toolbox
@@ -164,6 +167,12 @@ target_link_libraries(async_slam_toolbox toolbox_common kartoSlamToolbox ${Boost
 add_executable(async_slam_toolbox_node src/slam_toolbox_async_node.cpp)
 target_link_libraries(async_slam_toolbox_node async_slam_toolbox)
 
+add_library(offline_slam_toolbox src/slam_toolbox_offline.cpp)
+ament_target_dependencies(offline_slam_toolbox rosbag2_cpp)
+target_link_libraries(offline_slam_toolbox toolbox_common kartoSlamToolbox ${Boost_LIBRARIES})
+add_executable(offline_slam_toolbox_node src/slam_toolbox_offline_node.cpp)
+target_link_libraries(offline_slam_toolbox_node offline_slam_toolbox)
+
 add_library(sync_slam_toolbox src/slam_toolbox_sync.cpp)
 target_link_libraries(sync_slam_toolbox toolbox_common kartoSlamToolbox ${Boost_LIBRARIES})
 add_executable(sync_slam_toolbox_node src/slam_toolbox_sync_node.cpp)
@@ -212,6 +221,7 @@ rclcpp_components_register_nodes(map_and_localization_slam_toolbox "slam_toolbox
 
 #### Install
 install(TARGETS async_slam_toolbox_node
+                offline_slam_toolbox_node
                 sync_slam_toolbox_node
                 localization_slam_toolbox_node
                 map_and_localization_slam_toolbox_node
